@@ -2,7 +2,7 @@
 /*
 Plugin Name: Multisite HTML Sitemap (Shortcode)
 Description: Provides the [multisite_sitemap] shortcode that lists published Pages across all public sites in a multisite network.
-Version: 1.0.0
+Version: 1.1.0
 Author: Scott Mather
 Requires at least: 6.0
 Requires PHP: 7.4
@@ -123,12 +123,13 @@ function mhs_render_multisite_sitemap() {
     // Generate cache key based on network and main site
     $main_site_id = get_main_site_id();
     $network_id = get_current_network_id();
+    
+    // Get all sites with more permissive parameters
     $sites = get_sites(array(
-        'public' => 1,
-        'archived' => 0,
-        'spam' => 0,
-        'deleted' => 0
+        'number' => 0,  // 0 means no limit - get all sites
+        'network_id' => $network_id
     ));
+    
     $site_count = count($sites);
     $cache_key = "mhs_sitemap_{$network_id}_{$main_site_id}_{$site_count}";
     
@@ -142,7 +143,7 @@ function mhs_render_multisite_sitemap() {
     $html = '<div class="mhs-sitemap">';
     
     if (empty($sites)) {
-        $html .= '<p>No pages found.</p>';
+        $html .= '<p>No sites found in network.</p>';
         $html .= '</div>';
         return $html;
     }
@@ -150,42 +151,115 @@ function mhs_render_multisite_sitemap() {
     $has_content = false;
     
     foreach ($sites as $site) {
-        // Switch to the site
-        switch_to_blog($site->blog_id);
-        
-        // Get all published pages
-        $pages = get_posts(array(
-            'post_type' => 'page',
-            'post_status' => 'publish',
-            'numberposts' => -1,
-            'orderby' => 'title',
-            'order' => 'ASC'
-        ));
-        
-        // Skip sites with no pages
-        if (empty($pages)) {
-            restore_current_blog();
+        // Filter out non-public, archived, spam, or deleted sites manually
+        if ($site->public != 1 || $site->archived == 1 || $site->spam == 1 || $site->deleted == 1) {
             continue;
         }
         
-        // Get site details
+        // Switch to the site
+        switch_to_blog($site->blog_id);
+        
+        // Get site details first
         $site_name = get_bloginfo('name');
         $site_url = get_home_url();
+        $current_blog_id = get_current_blog_id();
         
-        // Build page tree
-        $page_tree = mhs_build_page_tree($pages);
+        // Show all sites, even those with no pages
+        $has_content = true;
         
-        // Render site section
-        if (!empty($page_tree)) {
-            $has_content = true;
-            
-            $html .= '<section class="mhs-site">';
-            $html .= '<h2 class="mhs-site-title">';
-            $html .= '<a href="' . esc_url($site_url) . '">' . esc_html($site_name) . '</a>';
-            $html .= '</h2>';
-            $html .= mhs_render_page_tree($page_tree);
-            $html .= '</section>';
+        $html .= '<section class="mhs-site">';
+        $html .= '<h2 class="mhs-site-title">';
+        $html .= '<a href="' . esc_url($site_url) . '">' . esc_html($site_name) . '</a>';
+        $html .= '</h2>';
+        
+        // Comprehensive debugging - check multiple post statuses and methods
+        global $wpdb;
+        
+        // Direct database query to see what's really there
+        $db_pages = $wpdb->get_results($wpdb->prepare(
+            "SELECT ID, post_title, post_status, post_parent FROM {$wpdb->posts} 
+             WHERE post_type = 'page' AND post_status IN ('publish', 'private', 'draft') 
+             ORDER BY post_title ASC"
+        ));
+        
+        // Try get_posts with different parameters
+        $pages_publish = get_posts(array(
+            'post_type' => 'page',
+            'post_status' => 'publish',
+            'numberposts' => -1,
+            'suppress_filters' => false
+        ));
+        
+        // Try get_pages function
+        $pages_get_pages = get_pages(array(
+            'post_status' => 'publish',
+            'number' => 0
+        ));
+        
+        // Try WP_Query
+        $query = new WP_Query(array(
+            'post_type' => 'page',
+            'post_status' => 'publish',
+            'posts_per_page' => -1,
+            'suppress_filters' => false
+        ));
+        $pages_wp_query = $query->posts;
+        
+        // Debug output
+        $html .= '<div style="background: #ffffcc; padding: 5px; margin: 5px 0; font-size: 12px;">';
+        $html .= '<strong>DEBUG for Site ID: ' . $current_blog_id . '</strong><br>';
+        $html .= 'Target Site ID: ' . $site->blog_id . ' | Current Blog ID: ' . $current_blog_id . '<br>';
+        $html .= 'Database query found: ' . count($db_pages) . ' pages (all statuses)<br>';
+        $html .= 'get_posts() found: ' . count($pages_publish) . ' published pages<br>';
+        $html .= 'get_pages() found: ' . count($pages_get_pages) . ' published pages<br>';
+        $html .= 'WP_Query found: ' . count($pages_wp_query) . ' published pages<br>';
+        
+        if (!empty($db_pages)) {
+            $html .= 'Page statuses in DB: ';
+            $statuses = array();
+            foreach ($db_pages as $page) {
+                $statuses[] = $page->post_status;
+            }
+            $html .= implode(', ', array_unique($statuses)) . '<br>';
         }
+        $html .= '</div>';
+        
+        // Use the method that found the most pages
+        $pages = array();
+        if (!empty($pages_publish)) {
+            $pages = $pages_publish;
+        } elseif (!empty($pages_get_pages)) {
+            $pages = $pages_get_pages;
+        } elseif (!empty($pages_wp_query)) {
+            $pages = $pages_wp_query;
+        } elseif (!empty($db_pages)) {
+            // If WordPress queries failed but database has published pages, use database results
+            $published_db_pages = array_filter($db_pages, function($page) {
+                return $page->post_status === 'publish';
+            });
+            
+            if (!empty($published_db_pages)) {
+                // Convert database results to WP_Post objects
+                $pages = array();
+                foreach ($published_db_pages as $db_page) {
+                    $post = get_post($db_page->ID);
+                    if ($post && $post->post_status === 'publish') {
+                        $pages[] = $post;
+                    }
+                }
+            }
+        }
+        
+        if (!empty($pages)) {
+            // Build and render page tree
+            $page_tree = mhs_build_page_tree($pages);
+            $html .= mhs_render_page_tree($page_tree);
+            $html .= '<p><small><em>Successfully loaded ' . count($pages) . ' pages</em></small></p>';
+        } else {
+            $html .= '<p><em>No published pages found using any method.</em></p>';
+        }
+        
+        $html .= '</section>';
         
         // Restore to main site
         restore_current_blog();
@@ -193,7 +267,7 @@ function mhs_render_multisite_sitemap() {
     
     // If no content was found
     if (!$has_content) {
-        $html .= '<p>No pages found.</p>';
+        $html .= '<p>No public sites found in network.</p>';
     }
     
     $html .= '</div>';
@@ -248,7 +322,8 @@ function mhs_clear_sitemap_cache($post_id) {
         'public' => 1,
         'archived' => 0,
         'spam' => 0,
-        'deleted' => 0
+        'deleted' => 0,
+        'number' => 0  // 0 means no limit - get all sites
     ));
     $site_count = count($sites);
     $cache_key = "mhs_sitemap_{$network_id}_{$main_site_id}_{$site_count}";
