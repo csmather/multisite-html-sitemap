@@ -2,7 +2,7 @@
 /*
 Plugin Name: Multisite HTML Sitemap (Shortcode)
 Description: Provides the [multisite_sitemap] shortcode that lists published Pages across all public sites in a multisite network.
-Version: 1.1.0
+Version: 1.2.0
 Author: Scott Mather
 Requires at least: 6.0
 Requires PHP: 7.4
@@ -93,7 +93,8 @@ function mhs_render_page_tree($tree, $parent_id = 0) {
         $page_url = get_permalink($page->ID);
         $page_title = esc_html($page->post_title);
         
-        $html .= '<li>';
+        // Add required class for search functionality
+        $html .= '<li class="mhs-page-item">';
         $html .= '<a href="' . esc_url($page_url) . '">' . $page_title . '</a>';
         
         // Render children if they exist
@@ -139,8 +140,16 @@ function mhs_render_multisite_sitemap() {
         return $cached_html;
     }
     
-    // Start building the sitemap
+    // Start building the sitemap with search functionality
     $html = '<div class="mhs-sitemap">';
+    
+    // Add search form at the top
+    $html .= '<form class="mhs-search" role="search" onsubmit="return false" aria-label="Search all sites">';
+    $html .= '<label class="screen-reader-text" for="mhs-q">Search all pages</label>';
+    $html .= '<input id="mhs-q" name="q" type="search" inputmode="search" autocomplete="off" placeholder="Search all sites…" aria-describedby="mhs-count" />';
+    $html .= '<button type="button" id="mhs-clear" aria-label="Clear search" hidden>&times;</button>';
+    $html .= '<div id="mhs-count" class="mhs-count" aria-live="polite"></div>';
+    $html .= '</form>';
     
     if (empty($sites)) {
         $html .= '<p>No sites found in network.</p>';
@@ -162,86 +171,57 @@ function mhs_render_multisite_sitemap() {
         // Get site details first
         $site_name = get_bloginfo('name');
         $site_url = get_home_url();
-        $current_blog_id = get_current_blog_id();
         
         // Show all sites, even those with no pages
         $has_content = true;
         
-        $html .= '<section class="mhs-site">';
+        // Add data-site attribute for search functionality
+        $html .= '<section class="mhs-site" data-site="' . esc_attr($site_name) . '">';
         $html .= '<h2 class="mhs-site-title">';
         $html .= '<a href="' . esc_url($site_url) . '">' . esc_html($site_name) . '</a>';
         $html .= '</h2>';
         
-        // Comprehensive debugging - check multiple post statuses and methods
+        // Get pages using multiple methods with database fallback
         global $wpdb;
         
-        // Direct database query to see what's really there
-        $db_pages = $wpdb->get_results($wpdb->prepare(
-            "SELECT ID, post_title, post_status, post_parent FROM {$wpdb->posts} 
-             WHERE post_type = 'page' AND post_status IN ('publish', 'private', 'draft') 
-             ORDER BY post_title ASC"
-        ));
-        
-        // Try get_posts with different parameters
-        $pages_publish = get_posts(array(
+        // Try get_posts first
+        $pages = get_posts(array(
             'post_type' => 'page',
             'post_status' => 'publish',
             'numberposts' => -1,
             'suppress_filters' => false
         ));
         
-        // Try get_pages function
-        $pages_get_pages = get_pages(array(
-            'post_status' => 'publish',
-            'number' => 0
-        ));
-        
-        // Try WP_Query
-        $query = new WP_Query(array(
-            'post_type' => 'page',
-            'post_status' => 'publish',
-            'posts_per_page' => -1,
-            'suppress_filters' => false
-        ));
-        $pages_wp_query = $query->posts;
-        
-        // Debug output
-        $html .= '<div style="background: #ffffcc; padding: 5px; margin: 5px 0; font-size: 12px;">';
-        $html .= '<strong>DEBUG for Site ID: ' . $current_blog_id . '</strong><br>';
-        $html .= 'Target Site ID: ' . $site->blog_id . ' | Current Blog ID: ' . $current_blog_id . '<br>';
-        $html .= 'Database query found: ' . count($db_pages) . ' pages (all statuses)<br>';
-        $html .= 'get_posts() found: ' . count($pages_publish) . ' published pages<br>';
-        $html .= 'get_pages() found: ' . count($pages_get_pages) . ' published pages<br>';
-        $html .= 'WP_Query found: ' . count($pages_wp_query) . ' published pages<br>';
-        
-        if (!empty($db_pages)) {
-            $html .= 'Page statuses in DB: ';
-            $statuses = array();
-            foreach ($db_pages as $page) {
-                $statuses[] = $page->post_status;
-            }
-            $html .= implode(', ', array_unique($statuses)) . '<br>';
+        // If no pages found, try get_pages
+        if (empty($pages)) {
+            $pages = get_pages(array(
+                'post_status' => 'publish',
+                'number' => 0
+            ));
         }
-        $html .= '</div>';
         
-        // Use the method that found the most pages
-        $pages = array();
-        if (!empty($pages_publish)) {
-            $pages = $pages_publish;
-        } elseif (!empty($pages_get_pages)) {
-            $pages = $pages_get_pages;
-        } elseif (!empty($pages_wp_query)) {
-            $pages = $pages_wp_query;
-        } elseif (!empty($db_pages)) {
-            // If WordPress queries failed but database has published pages, use database results
-            $published_db_pages = array_filter($db_pages, function($page) {
-                return $page->post_status === 'publish';
-            });
+        // If still no pages, try WP_Query
+        if (empty($pages)) {
+            $query = new WP_Query(array(
+                'post_type' => 'page',
+                'post_status' => 'publish',
+                'posts_per_page' => -1,
+                'suppress_filters' => false
+            ));
+            $pages = $query->posts;
+        }
+        
+        // Database fallback if WordPress queries fail
+        if (empty($pages)) {
+            $db_pages = $wpdb->get_results($wpdb->prepare(
+                "SELECT ID, post_title, post_status, post_parent FROM {$wpdb->posts} 
+                 WHERE post_type = 'page' AND post_status = 'publish' 
+                 ORDER BY post_title ASC"
+            ));
             
-            if (!empty($published_db_pages)) {
-                // Convert database results to WP_Post objects
+            if (!empty($db_pages)) {
                 $pages = array();
-                foreach ($published_db_pages as $db_page) {
+                foreach ($db_pages as $db_page) {
                     $post = get_post($db_page->ID);
                     if ($post && $post->post_status === 'publish') {
                         $pages[] = $post;
@@ -254,9 +234,8 @@ function mhs_render_multisite_sitemap() {
             // Build and render page tree
             $page_tree = mhs_build_page_tree($pages);
             $html .= mhs_render_page_tree($page_tree);
-            $html .= '<p><small><em>Successfully loaded ' . count($pages) . ' pages</em></small></p>';
         } else {
-            $html .= '<p><em>No published pages found using any method.</em></p>';
+            $html .= '<p><em>No published pages found.</em></p>';
         }
         
         $html .= '</section>';
@@ -269,6 +248,256 @@ function mhs_render_multisite_sitemap() {
     if (!$has_content) {
         $html .= '<p>No public sites found in network.</p>';
     }
+    
+    // Add inline CSS for search functionality
+    $html .= '<style>
+    .mhs-search {
+        margin-bottom: 2rem;
+        padding: 1rem;
+        background: #f9f9f9;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        position: relative;
+    }
+    .mhs-search input[type="search"] {
+        width: 100%;
+        padding: 0.75rem 3rem 0.75rem 1rem;
+        font-size: 1rem;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        box-sizing: border-box;
+    }
+    .mhs-search input[type="search"]:focus {
+        outline: 2px solid #0073aa;
+        outline-offset: -2px;
+        border-color: #0073aa;
+    }
+    #mhs-clear {
+        position: absolute;
+        right: 1.5rem;
+        top: 50%;
+        transform: translateY(-50%);
+        background: none;
+        border: none;
+        font-size: 1.5rem;
+        cursor: pointer;
+        color: #666;
+        padding: 0.25rem;
+        line-height: 1;
+    }
+    #mhs-clear:hover {
+        color: #000;
+    }
+    .mhs-count {
+        margin-top: 0.5rem;
+        font-size: 0.9rem;
+        color: #666;
+    }
+    .screen-reader-text {
+        position: absolute !important;
+        clip: rect(1px, 1px, 1px, 1px);
+        width: 1px !important;
+        height: 1px !important;
+        overflow: hidden;
+    }
+    .mhs-page-item[hidden] {
+        display: none !important;
+    }
+    .mhs-site[hidden] {
+        display: none !important;
+    }
+    .mhs-h {
+        background: #ffff00;
+        font-weight: bold;
+    }
+    .mhs-sitemap ul {
+        list-style: disc;
+        margin-left: 2rem;
+    }
+    .mhs-sitemap ul ul {
+        margin-left: 1.5rem;
+    }
+    .mhs-site {
+        margin-bottom: 2rem;
+    }
+    .mhs-site-title {
+        margin-bottom: 1rem;
+        font-size: 1.5rem;
+    }
+    .mhs-site-title a {
+        text-decoration: none;
+        color: #0073aa;
+    }
+    .mhs-site-title a:hover {
+        text-decoration: underline;
+    }
+    </style>';
+    
+    // Add inline JavaScript for search functionality
+    $html .= '<script>
+    (function() {
+        "use strict";
+        
+        let debounceTimer;
+        let originalTitles = new Map();
+        
+        function initSearch() {
+            const container = document.querySelector(".mhs-sitemap");
+            if (!container) return;
+            
+            const searchInput = container.querySelector("#mhs-q");
+            const clearBtn = container.querySelector("#mhs-clear");
+            const countDiv = container.querySelector("#mhs-count");
+            
+            if (!searchInput || !clearBtn || !countDiv) return;
+            
+            // Store original titles for restoration
+            container.querySelectorAll(".mhs-page-item a").forEach(link => {
+                originalTitles.set(link, link.innerHTML);
+            });
+            
+            // Check for URL parameter
+            const urlParams = new URLSearchParams(window.location.search);
+            const queryParam = urlParams.get("q");
+            if (queryParam) {
+                searchInput.value = queryParam;
+                performSearch(queryParam);
+            } else {
+                updateCount();
+            }
+            
+            // Search input handler
+            searchInput.addEventListener("input", function() {
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => {
+                    performSearch(this.value);
+                }, 150);
+            });
+            
+            // Clear button handler
+            clearBtn.addEventListener("click", clearSearch);
+            
+            // Escape key handler
+            searchInput.addEventListener("keydown", function(e) {
+                if (e.key === "Escape") {
+                    clearSearch();
+                }
+            });
+            
+            function performSearch(query) {
+                const trimmedQuery = query.trim();
+                clearBtn.hidden = !trimmedQuery;
+                
+                if (!trimmedQuery) {
+                    showAllItems();
+                    updateCount();
+                    return;
+                }
+                
+                const searchTerm = trimmedQuery.toLowerCase()
+                    .normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // Remove diacritics
+                
+                let visiblePages = 0;
+                let visibleSites = 0;
+                
+                container.querySelectorAll(".mhs-site").forEach(site => {
+                    const siteName = (site.dataset.site || "").toLowerCase()
+                        .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                    let siteHasVisiblePages = false;
+                    
+                    site.querySelectorAll(".mhs-page-item").forEach(item => {
+                        const link = item.querySelector("a");
+                        if (!link) return;
+                        
+                        // Restore original title
+                        link.innerHTML = originalTitles.get(link) || link.innerHTML;
+                        
+                        const pageTitle = link.textContent.toLowerCase()
+                            .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                        
+                        const matches = pageTitle.includes(searchTerm) || siteName.includes(searchTerm);
+                        
+                        if (matches) {
+                            item.hidden = false;
+                            siteHasVisiblePages = true;
+                            visiblePages++;
+                            
+                            // Highlight first match in page title
+                            const titleText = link.textContent;
+                            const titleLower = titleText.toLowerCase()
+                                .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                            const matchIndex = titleLower.indexOf(searchTerm);
+                            
+                            if (matchIndex !== -1) {
+                                const beforeMatch = titleText.substring(0, matchIndex);
+                                const match = titleText.substring(matchIndex, matchIndex + searchTerm.length);
+                                const afterMatch = titleText.substring(matchIndex + searchTerm.length);
+                                
+                                link.innerHTML = escapeHtml(beforeMatch) + 
+                                    \'<mark class="mhs-h">\' + escapeHtml(match) + \'</mark>\' + 
+                                    escapeHtml(afterMatch);
+                            }
+                        } else {
+                            item.hidden = true;
+                        }
+                    });
+                    
+                    if (siteHasVisiblePages) {
+                        site.hidden = false;
+                        visibleSites++;
+                    } else {
+                        site.hidden = true;
+                    }
+                });
+                
+                updateCount(visiblePages, visibleSites);
+            }
+            
+            function clearSearch() {
+                searchInput.value = "";
+                clearBtn.hidden = true;
+                showAllItems();
+                updateCount();
+                searchInput.focus();
+            }
+            
+            function showAllItems() {
+                container.querySelectorAll(".mhs-site, .mhs-page-item").forEach(item => {
+                    item.hidden = false;
+                });
+                
+                // Restore original titles
+                container.querySelectorAll(".mhs-page-item a").forEach(link => {
+                    link.innerHTML = originalTitles.get(link) || link.innerHTML;
+                });
+            }
+            
+            function updateCount(pages = null, sites = null) {
+                if (pages === null) {
+                    pages = container.querySelectorAll(".mhs-page-item").length;
+                }
+                if (sites === null) {
+                    sites = container.querySelectorAll(".mhs-site").length;
+                }
+                
+                countDiv.textContent = pages + " result" + (pages !== 1 ? "s" : "") + 
+                    " in " + sites + " site" + (sites !== 1 ? "s" : "");
+            }
+            
+            function escapeHtml(text) {
+                const div = document.createElement("div");
+                div.textContent = text;
+                return div.innerHTML;
+            }
+        }
+        
+        if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", initSearch);
+        } else {
+            initSearch();
+        }
+    })();
+    </script>';
     
     $html .= '</div>';
     
