@@ -1,8 +1,8 @@
 <?php
 /*
 Plugin Name: Multisite HTML Sitemap (Shortcode)
-Description: Provides the [multisite_sitemap] shortcode that lists published Pages across all public sites in a multisite network.
-Version: 1.2.0
+Description: Provides the [multisite_sitemap] shortcode that lists published Pages across all public sites in a multisite network. Also includes [network_search_form] and [network_search] shortcodes with FootEducation.com integration.
+Version: 1.3.0
 Author: Scott Mather
 Requires at least: 6.0
 Requires PHP: 7.4
@@ -12,6 +12,9 @@ Network: true
 if (!defined('ABSPATH')) {
     exit;
 }
+
+// Load header search functionality
+require_once plugin_dir_path(__FILE__) . 'includes/class-mhs-header-search.php';
 
 /**
  * Build a hierarchical tree structure from flat pages array
