@@ -13,6 +13,9 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+// Load configuration class first
+require_once plugin_dir_path(__FILE__) . 'includes/class-mhs-config.php';
+
 // Load header search functionality
 require_once plugin_dir_path(__FILE__) . 'includes/class-mhs-header-search.php';
 

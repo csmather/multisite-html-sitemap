@@ -3,7 +3,25 @@
  * Multisite Header Search Class
  * 
  * Provides header search form shortcode and network search results functionality
- * with FootEducation.com integration.
+ * with configurable cross-domain support.
+ * 
+ * Example customizations:
+ * 
+ * // Customize search form action URL
+ * add_filter('mhs_network_search_action', function($url) {
+ *     return 'https://orthoeducation.com/search-results/';
+ * });
+ * 
+ * // Customize suggest API URL
+ * add_filter('mhs_network_search_api', function($url) {
+ *     return 'https://orthoeducation.com/wp-json/mhs/v1/suggest';
+ * });
+ * 
+ * // Filter sites for suggestions (exclude specific sites)
+ * add_filter('mhs_suggest_sites_args', function($args) {
+ *     $args['site__not_in'] = [2, 3]; // Exclude site IDs 2 and 3
+ *     return $args;
+ * });
  * 
  * @package MultisiteHTMLSitemap
  * @since 1.2.0
@@ -39,7 +57,8 @@ class MHS_Header_Search {
      * 
      * Dev notes:
      * - To change destination: use filter 'mhs_network_search_action' or shortcode attr action=""
-     * - Form submits to main site's /network-search/ page by default
+     * - Form submits to aggregator's results page by default
+     * - API calls aggregator's suggest endpoint by default
      * 
      * @param array $atts Shortcode attributes
      * @return string HTML form output with inline CSS and JS
@@ -47,20 +66,29 @@ class MHS_Header_Search {
     public function render_search_form($atts) {
         $atts = shortcode_atts(array(
             'action' => '',
+            'api' => '',
         ), $atts, 'network_search_form');
         
-        // Default action URL - main site's network search page
+        // Get aggregator base URL and compute defaults
+        $agg = rtrim(MHS_Config::aggregator_base_url(), '/');
+        
+        // Default action URL - aggregator's results page
         if (empty($atts['action'])) {
-            $action = get_home_url(get_main_site_id(), '/network-search/');
+            $action = $agg . MHS_Config::results_path();
         } else {
             $action = $atts['action'];
         }
         
-        // Apply filter for programmatic override
-        $action = apply_filters('mhs_network_search_action', $action);
+        // Default API URL - aggregator's suggest endpoint
+        if (empty($atts['api'])) {
+            $api_url = $agg . MHS_Config::suggest_path();
+        } else {
+            $api_url = $atts['api'];
+        }
         
-        // API endpoint URL
-        $api_url = home_url('/wp-json/mhs/v1/suggest');
+        // Apply filters for programmatic override
+        $action = apply_filters('mhs_network_search_action', $action);
+        $api_url = apply_filters('mhs_network_search_api', $api_url);
         
         // Build the form HTML with typeahead structure
         $html = '<form class="mhs-global-search" role="search" action="' . esc_url($action) . '" method="get" data-api="' . esc_url($api_url) . '">';
@@ -406,16 +434,15 @@ class MHS_Header_Search {
      * Render network search results
      * 
      * Dev notes:
-     * - To disable FootEducation results per page: [network_search include_fe="0"]
-     * - To adjust FootEducation base URL: add_filter('mhs_fe_base_url', fn() => 'https://staging.footeducation.com')
+     * - Uses MHS_Config::search_sources() to determine what sources to search
+     * - Sources can be 'multisite' (local network) or 'wp' (remote WordPress sites)
+     * - Cache TTL configurable via MHS_Config::results_cache_ttl()
      * 
      * @param array $atts Shortcode attributes
      * @return string HTML search results
      */
     public function render_search_results($atts) {
-        $atts = shortcode_atts(array(
-            'include_fe' => '1',
-        ), $atts, 'network_search');
+        $atts = shortcode_atts(array(), $atts, 'network_search');
         
         // Get and sanitize search query
         $query = '';
@@ -428,20 +455,29 @@ class MHS_Header_Search {
         }
         
         // Check cache first
-        $cache_key = 'mhs_search_' . md5(strtolower($query) . '_' . $atts['include_fe']);
+        $cache_key = 'mhs_search_' . md5(strtolower($query));
         $cached_results = get_transient($cache_key);
         
         if ($cached_results !== false) {
             return $cached_results;
         }
         
-        // Perform search
-        $hits = $this->search_multisite_pages($query);
+        // Perform search across all configured sources
+        $hits = array();
+        $sources = MHS_Config::search_sources();
         
-        // Include FootEducation results if enabled
-        if ($atts['include_fe'] === '1') {
-            $fe_hits = $this->fetch_remote_fe_pages($query);
-            $hits = array_merge($hits, $fe_hits);
+        foreach ($sources as $source) {
+            if (!isset($source['type'])) {
+                continue;
+            }
+            
+            if ($source['type'] === 'multisite') {
+                $source_hits = $this->search_multisite_source($query, $source);
+                $hits = array_merge($hits, $source_hits);
+            } elseif ($source['type'] === 'wp') {
+                $source_hits = $this->search_wp_source($query, $source);
+                $hits = array_merge($hits, $source_hits);
+            }
         }
         
         // Remove duplicates by URL and sort results
@@ -450,14 +486,189 @@ class MHS_Header_Search {
         // Generate HTML output
         $html = $this->render_results_html($query, $hits);
         
-        // Cache results for 10 minutes
-        set_transient($cache_key, $html, 10 * MINUTE_IN_SECONDS);
+        // Cache results with configurable TTL
+        $cache_ttl = MHS_Config::results_cache_ttl();
+        set_transient($cache_key, $html, $cache_ttl);
         
         return $html;
     }
     
     /**
-     * Search pages across all multisite network sites
+     * Search multisite source for results
+     * 
+     * @param string $query Search query
+     * @param array $source Source configuration
+     * @return array Array of search hits
+     */
+    private function search_multisite_source($query, $source) {
+        if (!is_multisite()) {
+            return array();
+        }
+        
+        $hits = array();
+        $post_types = $source['post_types'] ?? ['page'];
+        $limit = $source['limit'] ?? 20;
+        
+        $sites = get_sites(array(
+            'number' => 0,
+            'network_id' => get_current_network_id(),
+            'public' => 1,
+            'archived' => 0,
+            'spam' => 0,
+            'deleted' => 0
+        ));
+        
+        foreach ($sites as $site) {
+            switch_to_blog($site->blog_id);
+            
+            $site_name = get_bloginfo('name');
+            $site_url = get_home_url();
+            
+            // Search each configured post type
+            foreach ($post_types as $post_type) {
+                // Search posts on this site
+                $posts = get_posts(array(
+                    'post_type' => $post_type,
+                    'post_status' => 'publish',
+                    's' => $query,
+                    'numberposts' => min($limit, 10), // Limit per post type per site
+                    'suppress_filters' => false
+                ));
+                
+                // If no results with get_posts, try database fallback
+                if (empty($posts)) {
+                    global $wpdb;
+                    $like_query = '%' . $wpdb->esc_like($query) . '%';
+                    $db_posts = $wpdb->get_results($wpdb->prepare(
+                        "SELECT ID, post_title, post_modified FROM {$wpdb->posts} 
+                         WHERE post_type = %s AND post_status = 'publish' 
+                         AND (post_title LIKE %s OR post_content LIKE %s)
+                         ORDER BY post_title ASC LIMIT %d",
+                        $post_type,
+                        $like_query,
+                        $like_query,
+                        min($limit, 10)
+                    ));
+                    
+                    if (!empty($db_posts)) {
+                        $posts = array();
+                        foreach ($db_posts as $db_post) {
+                            $post = get_post($db_post->ID);
+                            if ($post && $post->post_status === 'publish') {
+                                $posts[] = $post;
+                            }
+                        }
+                    }
+                }
+                
+                // Process results for this post type
+                foreach ($posts as $post) {
+                    $score = $this->calculate_relevance_score($post->post_title, $query);
+                    
+                    $hits[] = array(
+                        'title' => $post->post_title,
+                        'url' => get_permalink($post->ID),
+                        'site_name' => $site_name,
+                        'site_url' => $site_url,
+                        'modified' => strtotime($post->post_modified),
+                        'score' => $score
+                    );
+                }
+            }
+            
+            restore_current_blog();
+        }
+        
+        return $hits;
+    }
+    
+    /**
+     * Search remote WordPress source for results
+     * 
+     * @param string $query Search query
+     * @param array $source Source configuration
+     * @return array Array of search hits
+     */
+    private function search_wp_source($query, $source) {
+        if (!isset($source['base'])) {
+            return array();
+        }
+        
+        $hits = array();
+        $base_url = rtrim($source['base'], '/');
+        $post_types = $source['post_types'] ?? ['page'];
+        $limit = $source['limit'] ?? 20;
+        $timeout = MHS_Config::remote_timeout();
+        
+        // Check transient cache first
+        $cache_key = 'mhs_wp_source_' . md5($base_url . '_' . strtolower($query));
+        $cached_results = get_transient($cache_key);
+        
+        if ($cached_results !== false) {
+            return $cached_results;
+        }
+        
+        // Extract site name from base URL
+        $parsed_url = parse_url($base_url);
+        $site_name = $parsed_url['host'] ?? $base_url;
+        
+        // For each post type, make a separate API call
+        foreach ($post_types as $post_type) {
+            // Build API URL
+            $api_url = $base_url . '/wp-json/wp/v2/' . $post_type;
+            $api_url = add_query_arg(array(
+                'search' => urlencode($query),
+                '_fields' => 'id,link,title,modified',
+                'per_page' => min($limit, 20) // Limit per post type
+            ), $api_url);
+            
+            // Make remote request
+            $response = wp_remote_get($api_url, array(
+                'timeout' => $timeout,
+                'sslverify' => true,
+                'user-agent' => 'WordPress/' . get_bloginfo('version') . '; ' . get_bloginfo('url')
+            ));
+            
+            // Handle errors gracefully
+            if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+                continue; // Skip this post type and continue with others
+            }
+            
+            $body = wp_remote_retrieve_body($response);
+            $posts = json_decode($body, true);
+            
+            if (!is_array($posts)) {
+                continue;
+            }
+            
+            // Process results
+            foreach ($posts as $post) {
+                if (!isset($post['title']['rendered']) || !isset($post['link'])) {
+                    continue;
+                }
+                
+                $title = $post['title']['rendered'];
+                $score = $this->calculate_relevance_score($title, $query);
+                
+                $hits[] = array(
+                    'title' => $title,
+                    'url' => $post['link'],
+                    'site_name' => $site_name,
+                    'site_url' => $base_url,
+                    'modified' => isset($post['modified']) ? strtotime($post['modified']) : time(),
+                    'score' => $score
+                );
+            }
+        }
+        
+        // Cache results for 5 minutes
+        set_transient($cache_key, $hits, 5 * MINUTE_IN_SECONDS);
+        
+        return $hits;
+    }
+    
+    /**
+     * Search pages across all multisite network sites (legacy method)
      * 
      * @param string $query Search query
      * @return array Array of search hits
@@ -835,7 +1046,13 @@ class MHS_Header_Search {
         global $wpdb;
         $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_mhs_search_%' OR option_name LIKE '_transient_timeout_mhs_search_%'");
         
-        // Also clear FootEducation cache
+        // Clear suggestion caches
+        $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_mhs_suggest_%' OR option_name LIKE '_transient_timeout_mhs_suggest_%'");
+        
+        // Clear remote WordPress source caches
+        $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_mhs_wp_source_%' OR option_name LIKE '_transient_timeout_mhs_wp_source_%'");
+        
+        // Also clear legacy FootEducation cache
         $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_mhs_fe_%' OR option_name LIKE '_transient_timeout_mhs_fe_%'");
     }
     
@@ -861,8 +1078,8 @@ class MHS_Header_Search {
      * Register REST API endpoint for suggestions
      * 
      * Dev notes:
-     * - To change FootEducation base URL: add_filter('mhs_fe_base_url', fn() => 'https://staging.footeducation.com')
-     * - To change suggestion limit: add_filter('mhs_suggest_limit', fn() => 15)
+     * - Uses MHS_Config::search_sources() to determine what to search
+     * - CORS enabled for allowed origins from MHS_Config::allowed_origins()
      */
     public function register_suggest_endpoint() {
         register_rest_route('mhs/v1', '/suggest', array(
@@ -877,10 +1094,43 @@ class MHS_Header_Search {
                 ),
             ),
         ));
+        
+        // Add CORS support for suggest endpoint only
+        add_action('rest_pre_serve_request', array($this, 'add_cors_headers'), 10, 4);
+    }
+    
+    /**
+     * Add CORS headers for suggest endpoint
+     * 
+     * @param bool $served Whether the request has already been served
+     * @param WP_HTTP_Response $result Result to send to the client
+     * @param WP_REST_Request $request Request used to generate the response
+     * @param WP_REST_Server $server Server instance
+     * @return bool
+     */
+    public function add_cors_headers($served, $result, $request, $server) {
+        // Only apply CORS to our suggest endpoint
+        if (strpos($request->get_route(), '/mhs/v1/suggest') === false) {
+            return $served;
+        }
+        
+        $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+        $allowed_origins = MHS_Config::allowed_origins();
+        
+        if (in_array($origin, $allowed_origins, true)) {
+            header('Access-Control-Allow-Origin: ' . $origin);
+            header('Vary: Origin');
+            header('Access-Control-Allow-Methods: GET');
+            header('Access-Control-Allow-Headers: Content-Type');
+        }
+        
+        return $served;
     }
     
     /**
      * Handle suggestions REST API request
+     * 
+     * Uses MHS_Config::search_sources() to determine what sources to search
      * 
      * @param WP_REST_Request $request REST request object
      * @return WP_REST_Response|WP_Error Response object
@@ -902,14 +1152,22 @@ class MHS_Header_Search {
         }
         
         $suggestions = array();
+        $sources = MHS_Config::search_sources();
         
-        // Get suggestions from multisite network
-        $multisite_suggestions = $this->get_multisite_suggestions($query);
-        $suggestions = array_merge($suggestions, $multisite_suggestions);
-        
-        // Get FootEducation suggestions
-        $fe_suggestions = $this->get_fe_suggestions($query);
-        $suggestions = array_merge($suggestions, $fe_suggestions);
+        // Process each configured source
+        foreach ($sources as $source) {
+            if (!isset($source['type'])) {
+                continue;
+            }
+            
+            if ($source['type'] === 'multisite') {
+                $source_suggestions = $this->get_multisite_source_suggestions($query, $source);
+                $suggestions = array_merge($suggestions, $source_suggestions);
+            } elseif ($source['type'] === 'wp') {
+                $source_suggestions = $this->get_wp_source_suggestions($query, $source);
+                $suggestions = array_merge($suggestions, $source_suggestions);
+            }
+        }
         
         // Remove duplicates by URL
         $unique_suggestions = array();
@@ -922,18 +1180,145 @@ class MHS_Header_Search {
             }
         }
         
-        // Apply suggestion limit filter
-        $limit = apply_filters('mhs_suggest_limit', 10);
+        // Apply suggestion limit
+        $limit = MHS_Config::suggest_limit();
         $unique_suggestions = array_slice($unique_suggestions, 0, $limit);
         
-        // Cache for 60 seconds
-        set_transient($cache_key, $unique_suggestions, 60);
+        // Cache with configurable TTL
+        $cache_ttl = MHS_Config::suggest_cache_ttl();
+        set_transient($cache_key, $unique_suggestions, $cache_ttl);
         
         return rest_ensure_response($unique_suggestions);
     }
     
     /**
-     * Get suggestions from multisite network
+     * Get suggestions from multisite source
+     * 
+     * @param string $query Search query
+     * @param array $source Source configuration
+     * @return array Array of suggestions
+     */
+    private function get_multisite_source_suggestions($query, $source) {
+        if (!is_multisite()) {
+            return array();
+        }
+        
+        $suggestions = array();
+        $post_types = $source['post_types'] ?? ['page'];
+        
+        // Get sites with filterable args
+        $sites_args = apply_filters('mhs_suggest_sites_args', array(
+            'number' => 0,
+            'archived' => 0,
+            'spam' => 0,
+            'deleted' => 0,
+            'mature' => 0
+        ));
+        
+        $sites = get_sites($sites_args);
+        
+        foreach ($sites as $site) {
+            switch_to_blog($site->blog_id);
+            
+            $site_name = get_bloginfo('name');
+            
+            // Search each configured post type
+            foreach ($post_types as $post_type) {
+                $wp_query = new WP_Query(array(
+                    's' => $query,
+                    'post_type' => $post_type,
+                    'post_status' => 'publish',
+                    'fields' => 'ids',
+                    'posts_per_page' => 2, // Limit per post type per site
+                    'no_found_rows' => true,
+                    'orderby' => 'relevance'
+                ));
+                
+                foreach ($wp_query->posts as $post_id) {
+                    $post = get_post($post_id);
+                    if ($post) {
+                        $suggestions[] = array(
+                            't' => $post->post_title,
+                            'u' => get_permalink($post_id),
+                            's' => $site_name
+                        );
+                    }
+                }
+            }
+            
+            restore_current_blog();
+        }
+        
+        return $suggestions;
+    }
+    
+    /**
+     * Get suggestions from remote WordPress source
+     * 
+     * @param string $query Search query
+     * @param array $source Source configuration
+     * @return array Array of suggestions
+     */
+    private function get_wp_source_suggestions($query, $source) {
+        if (!isset($source['base'])) {
+            return array();
+        }
+        
+        $suggestions = array();
+        $base_url = rtrim($source['base'], '/');
+        $post_types = $source['post_types'] ?? ['page'];
+        $timeout = MHS_Config::remote_timeout();
+        
+        // For each post type, make a separate API call
+        foreach ($post_types as $post_type) {
+            // Build API URL
+            $api_url = $base_url . '/wp-json/wp/v2/' . $post_type;
+            $api_url = add_query_arg(array(
+                'search' => urlencode($query),
+                '_fields' => 'id,link,title',
+                'per_page' => 3 // Limit per post type
+            ), $api_url);
+            
+            // Make remote request
+            $response = wp_remote_get($api_url, array(
+                'timeout' => $timeout,
+                'sslverify' => true,
+                'user-agent' => 'WordPress/' . get_bloginfo('version') . '; ' . get_bloginfo('url')
+            ));
+            
+            // Handle errors gracefully
+            if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+                continue; // Skip this post type and continue with others
+            }
+            
+            $body = wp_remote_retrieve_body($response);
+            $posts = json_decode($body, true);
+            
+            if (!is_array($posts)) {
+                continue;
+            }
+            
+            // Extract site name from base URL
+            $parsed_url = parse_url($base_url);
+            $site_name = $parsed_url['host'] ?? $base_url;
+            
+            // Process results
+            foreach ($posts as $post) {
+                if (isset($post['title']['rendered']) && isset($post['link'])) {
+                    $suggestions[] = array(
+                        't' => $post['title']['rendered'],
+                        'u' => $post['link'],
+                        's' => $site_name
+                    );
+                }
+            }
+        }
+        
+        return $suggestions;
+    }
+    
+    /**
+     * Get suggestions from multisite network (legacy method)
      * 
      * @param string $query Search query
      * @return array Array of suggestions
